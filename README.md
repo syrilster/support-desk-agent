@@ -33,6 +33,16 @@ docker exec -i support-db psql -U support -d support -v ON_ERROR_STOP=1 < src/db
 
 Day to day: `docker start support-db` / `docker stop support-db`.
 
+## Run the agent
+
+From the project root, with the venv active and Postgres running:
+
+```bash
+PYTHONPATH=src python -m support_desk.agent_mcp
+```
+
+This starts the interactive agent. It launches the MCP server itself, so do not start the server separately. Type `quit` to exit. See [Day 5](#day-5-mcp-server-and-client) for details.
+
 ## Day 1: API basics and a first tool
 
 ```bash
