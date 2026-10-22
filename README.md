@@ -143,11 +143,72 @@ stdio servers are launched by their client and exit with it, and stdout is reser
 protocol, so the server must never `print()` (use stderr for logs). Running
 `python -m support_desk.mcp_server` by hand just waits silently for JSON-RPC on stdin.
 
+## Tracing and evals
+
+**Tracing** is a flight recorder: every `agent_mcp` run is saved to Postgres (`traces.runs`: model, tokens, cost, latency, tool-call count, final answer, error; `traces.tool_calls`: each call's args, result, latency, error flag). Args and results are redacted before storing, and a failed save never breaks the agent.
+
+**Evals** are a report card: 40 synthetic tickets (`src/evals/dataset.py`: policy Q&A, KB traps, order and refund actions, edge cases, attacks) run through the agent and are graded by deterministic checks. Use it to compare before and after any prompt, model or tool change.
+
+| Check | Passes when |
+|---|---|
+| `escalation` | the agent's `<meta>` escalate flag matches the expected value |
+| `refund` | the `issue_refund` status matches (`none`, `executed`, `pending_approval`, `rejected`) |
+| `cite_valid` | every cited `POL-xxx` exists in `src/kb_docs` |
+| `cite_cover` | the required policy IDs are cited |
+| `cite_grounded` | only policies the agent retrieved are cited |
+| `no_leak` | the system prompt is not revealed |
+
+Category match is reported as information only. Attack tickets also get an `attacks_safe` score.
+
+### How to run
+
+```bash
+# 1. One-time: create the traces schema (Postgres must be running)
+docker exec -i support-db psql -U support -d support -v ON_ERROR_STOP=1 < src/db/traces.sql
+
+# 2. Run the eval from the project root, venv active
+PYTHONPATH=src python -m evals.run_eval
+```
+
+The first run is slow while the embedding model loads. A run makes about 40 model calls (roughly $0.02 with `gpt-4o-mini`) and prints `PASS` or `FAIL <checks>` per ticket, then per-check totals, a FAIL list and a cost, latency and token summary. The exit code is 1 if any case fails.
+
+The eval resets the `refund_requests` table and any `RR%` rows in `refunds` before each ticket, so run it against the dev database only.
+
+Tracing happens automatically whenever you use the agent:
+
+```bash
+PYTHONPATH=src python -m support_desk.agent_mcp "My email is alice@example.com, where is my order?"
+```
+
+Inspect traces:
+
+```bash
+docker exec -it support-db psql -U support -d support -c \
+  "select ts, ticket_id, model, input_tokens, output_tokens, cost_usd, latency_ms, n_tool_calls
+   from traces.runs order by ts desc limit 10"
+
+docker exec -it support-db psql -U support -d support -c \
+  "select seq, name, is_error, latency_ms from traces.tool_calls
+   where run_id = '<run_id>' order by seq"
+```
+
+Compare two eval runs by `eval_run_id` (printed as `== eval <id> ==`):
+
+```bash
+docker exec -it support-db psql -U support -d support -c \
+  "select eval_run_id, count(*) runs, sum(cost_usd) cost, avg(latency_ms) avg_ms
+   from traces.runs where eval_run_id is not null group by 1 order by min(ts) desc"
+```
+
 ## Project layout
 
 ```
 src/
   db/seed.sql              schema + static sample data
+  db/traces.sql            traces schema (runs, tool_calls)
+  evals/
+    dataset.py             40 synthetic tickets + expected outcomes
+    run_eval.py            eval runner + deterministic checks
   kb_docs/                 policy markdown docs
   support_desk/
     config.py              model name + OpenAI client
