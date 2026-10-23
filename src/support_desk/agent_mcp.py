@@ -100,7 +100,7 @@ async def main() -> None:
             if len(sys.argv) > 1:
                 ctx = {"ticket_id": f"cli-{uuid.uuid4().hex[:8]}"}
                 messages.append({"role": "user", "content": " ".join(sys.argv[1:])})
-                print(await run_turn(client, session, tools, messages, ctx))
+                print(await traced_turn(client, session, tools, messages, ctx))
                 return
 
             print("Support Desk Copilot (MCP). Type 'quit' to exit.")
