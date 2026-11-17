@@ -16,7 +16,8 @@ python -m pip install -r requirements.txt
 
 # 2. Config
 cp .env.example .env
-# edit .env: set OPENAI_API_KEY (DATABASE_URL and COPILOT_MODEL have working defaults)
+# edit .env: set OPENAI_API_KEY (DATABASE_URL, COPILOT_MODEL and the pipeline
+# model vars have working defaults)
 
 # 3. Postgres (first time only)
 docker run -d --name support-db \
@@ -38,10 +39,16 @@ Day to day: `docker start support-db` / `docker stop support-db`.
 From the project root, with the venv active and Postgres running:
 
 ```bash
+# Single agent (MCP client; it starts the server itself)
 PYTHONPATH=src python -m support_desk.agent_mcp
+
+# Multi-agent pipeline (Day 6)
+PYTHONPATH=src python -m support_desk.pipeline_cli "My email is alice@example.com, where is my order?"
 ```
 
-This starts the interactive agent. It launches the MCP server itself, so do not start the server separately. Type `quit` to exit. See [Day 5](#day-5-mcp-server-and-client) for details.
+Both entry points are interactive when run without arguments; type `quit` to exit. Do not start the MCP server separately —
+both entry points launch it. See [Day 5](#day-5-mcp-server-and-client) and
+[Day 6](#day-6-multi-agent-pipeline).
 
 ## Day 1: API basics and a first tool
 
@@ -120,7 +127,7 @@ The same tools are exposed over MCP (stdio) by `mcp_server.py`:
 
 | MCP primitive | What it exposes | Controlled by |
 |---|---|---|
-| Tools | `lookup_customer`, `list_orders`, `get_refund_status`, `search_kb` | the model decides to call them |
+| Tools | `lookup_customer`, `list_orders`, `get_refund_status`, `search_kb`, `issue_refund` | the model decides to call them |
 | Resources | KB docs as `doc://kb/POL-001` ... | the application/user chooses to attach them |
 | Prompts | not implemented yet | the user picks a template |
 
@@ -143,9 +150,73 @@ stdio servers are launched by their client and exit with it, and stdout is reser
 protocol, so the server must never `print()` (use stderr for logs). Running
 `python -m support_desk.mcp_server` by hand just waits silently for JSON-RPC on stdin.
 
+## Day 6: Multi-agent pipeline
+
+A ticket-to-draft pipeline that sits next to the single agent. It is a separate entry point;
+Days 2 and 5 are unchanged.
+
+```
+ticket
+  → triage                pydantic-validated category, urgency, PII flag,
+                          needs_policy / needs_account routing flags
+  → research + account    only the workers triage asks for, parallel, MCP tools
+  → brief                 code-assembled, redacted, no model
+  → drafter               no tools, sees only the brief
+```
+
+| Stage | Default model | Tools | Context |
+|---|---|---|---|
+| triage | `TRIAGE_MODEL=gpt-4o-mini` | none | ticket + last 3 customer messages |
+| research | `WORKER_MODEL=gpt-4o-mini` | `search_kb` | ticket + triage |
+| account | `WORKER_MODEL=gpt-4o-mini` | `lookup_customer`, `list_orders`, `get_refund_status` | ticket + triage |
+| drafter | `DRAFTER_MODEL=gpt-4o` | none | brief only |
+
+- **Routing:** triage sets `needs_policy` and `needs_account`; a worker that is not needed is
+  skipped (shown as `skipped by triage`, model `-`, 0 tokens). `attack` and `out_of_scope`
+  skip both workers; `unknown` and `multi_intent` run both. A ticket can need both
+  (e.g. a return question about a specific order).
+- **Conversation:** the CLI keeps one `ticket_id` per conversation and passes the customer's
+  earlier messages (last 3) to triage only, so follow-ups like "and what about A1002?" resolve.
+  Workers and the drafter never see the history. Because verification is per `ticket_id`, a
+  different email in the same conversation is rejected; use `/new` first.
+- Both workers (when run) are MCP clients on one shared `ClientSession`; **the MCP server executes every
+  tool call**. The pipeline does not call `tools.py` directly.
+- Tool access is an allowlist per worker. `issue_refund` exists on the server but is filtered
+  out, so the pipeline is **read-only**.
+- The account worker must call `lookup_customer` first. `mcp_server` ignores the model-supplied
+  customer id and rejects `list_orders`/`get_refund_status` until the ticket is verified.
+- Every call carries `meta={"ticket_id": ...}`; verification state is per ticket.
+- The drafter never sees the raw ticket, tool payloads, or the other worker's prompt. It gets a
+  redacted `Brief`; citations are checked against `research.sources` and ungrounded ones are
+  dropped.
+- Triage uses structured output (`Triage` pydantic model) with one retry, then stops.
+- `PIPELINE_MAX_ITER` (default 3) caps each worker's tool loop.
+
+### Run
+
+```bash
+# One ticket (runs once and exits)
+PYTHONPATH=src python -m support_desk.pipeline_cli \
+  "I'm alice@example.com. Can I return headphones 20 days after delivery?"
+
+# Conversation: no argument; type tickets at the prompt
+PYTHONPATH=src python -m support_desk.pipeline_cli
+#   /new   start a fresh conversation (new ticket_id, history cleared)
+#   quit   exit
+
+# Show each worker's tool calls (debug output; not required)
+PYTHONPATH=src PIPELINE_VERBOSE=1 python -m support_desk.pipeline_cli "..."
+```
+
+The CLI prints triage, both worker summaries (a skipped worker says so), the brief's
+constraints, the draft, and per-stage tokens/cost/latency.
+
+The pipeline is read-only and deliberately minimal: no DB tracing for pipeline stages, no
+`read_doc`, no retries beyond triage. The eval runner (below) exercises the single agent only.
+
 ## Tracing and evals
 
-**Tracing** is a flight recorder: every `agent_mcp` run is saved to Postgres (`traces.runs`: model, tokens, cost, latency, tool-call count, final answer, error; `traces.tool_calls`: each call's args, result, latency, error flag). Args and results are redacted before storing, and a failed save never breaks the agent.
+**Tracing** is a flight recorder: every `agent_mcp` run is saved to Postgres (`traces.runs`: model, tokens, cost, latency, tool-call count, final answer, error; `traces.tool_calls`: each call's args, result, latency, error flag). Args and results are redacted before storing, and a failed save never breaks the agent. The pipeline currently keeps stage usage in memory only.
 
 **Evals** are a report card: 40 synthetic tickets (`src/evals/dataset.py`: policy Q&A, KB traps, order and refund actions, edge cases, attacks) run through the agent and are graded by deterministic checks. Use it to compare before and after any prompt, model or tool change.
 
@@ -174,7 +245,7 @@ The first run is slow while the embedding model loads. A run makes about 40 mode
 
 The eval resets the `refund_requests` table and any `RR%` rows in `refunds` before each ticket, so run it against the dev database only.
 
-Tracing happens automatically whenever you use the agent:
+Tracing happens automatically for one-shot `agent_mcp` runs (the interactive mode and the pipeline are not traced yet):
 
 ```bash
 PYTHONPATH=src python -m support_desk.agent_mcp "My email is alice@example.com, where is my order?"
@@ -211,12 +282,14 @@ src/
     run_eval.py            eval runner + deterministic checks
   kb_docs/                 policy markdown docs
   support_desk/
-    config.py              model name + OpenAI client
+    config.py              model names + OpenAI/AsyncOpenAI clients
     db.py                  Postgres connection
     tools.py               tool functions, schemas, safe dispatcher
     agent.py               agent loop + CLI (direct tool calls)
     agent_mcp.py           agent loop as an MCP client
     mcp_server.py          MCP server: tools + KB resources
+    pipeline.py            Day 6: triage + MCP workers + brief + drafter
+    pipeline_cli.py        Day 6: pipeline CLI (one-shot or conversation)
     kb.py                  KB loader + keyword (inverted index) search
     embed.py               chunking + embeddings + Chroma search
     day1_hello.py          Day 1: basic call
@@ -224,9 +297,19 @@ src/
 ```
 
 ## Troubleshooting
+
 - `ModuleNotFoundError: No module named 'support_desk'`: run from the project root with `PYTHONPATH=src`.
 - `ModuleNotFoundError: No module named 'openai'` (or `psycopg`): activate the venv and rerun `python -m pip install -r requirements.txt`. If the venv was moved, recreate it.
-- `mcp` import errors: this project pins `mcp==0.9.1`; use `python -m pip install -r requirements.txt`.
+- `mcp` import errors: run `python -m pip install -r requirements.txt`; this project requires `mcp>=1.30,<2`.
 - Slow first `search_kb`: the embedding model is loading and the Chroma index is being built.
 - `connection refused` on port 5432: start Docker and run `docker start support-db`.
 - `OPENAI_API_KEY is not set`: create `.env` from `.env.example`.
+- Pipeline says `Customer not verified`: the account worker must call `lookup_customer` with an
+  email from the ticket before `list_orders`/`get_refund_status`; the server keys verification
+  by `ticket_id`.
+- Pipeline shows `$0.00000` cost: add the model to `PRICING` in `tracing.py`; unknown models
+  are priced at zero.
+- Pipeline is slow on the first ticket: the first `search_kb` loads MiniLM and Chroma, and
+  `embed_search` builds the model per call. Warm it once before timing a run.
+- Concurrent MCP calls misbehave: wrap `session.call_tool` in an `asyncio.Lock`; model calls
+  stay parallel.

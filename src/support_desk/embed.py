@@ -1,5 +1,6 @@
 """Embedding-based search with chroma. Separate from keyword search."""
 import os
+import sys
 from functools import lru_cache
 
 import chromadb
@@ -61,7 +62,7 @@ def _get_collection():
                 documents=texts,
                 metadatas=metadatas,
             )
-        print(f"Indexed {len(docs)} docs into chroma at {CHROMA_DIR}")
+        print(f"Indexed {len(docs)} docs into chroma at {CHROMA_DIR}", file=sys.stderr)
     return collection
 
 
